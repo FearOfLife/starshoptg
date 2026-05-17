@@ -1,0 +1,234 @@
+from __future__ import annotations
+
+from decimal import Decimal
+from typing import Any
+
+import asyncpg
+
+from app.config import Settings
+
+
+SCHEMA_SQL = """
+CREATE TABLE IF NOT EXISTS users (
+    telegram_id BIGINT PRIMARY KEY,
+    username TEXT,
+    full_name TEXT NOT NULL DEFAULT '',
+    balance NUMERIC(12, 2) NOT NULL DEFAULT 0,
+    purchased_stars BIGINT NOT NULL DEFAULT 0,
+    is_admin BOOLEAN NOT NULL DEFAULT FALSE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS products (
+    id SERIAL PRIMARY KEY,
+    title TEXT NOT NULL,
+    stars BIGINT NOT NULL UNIQUE,
+    price_rub NUMERIC(12, 2) NOT NULL,
+    is_active BOOLEAN NOT NULL DEFAULT TRUE,
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+
+CREATE TABLE IF NOT EXISTS payments (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+    amount_rub NUMERIC(12, 2) NOT NULL CHECK (amount_rub > 0),
+    status TEXT NOT NULL DEFAULT 'pending',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    paid_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS buyers (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+    product_id INTEGER REFERENCES products(id) ON DELETE SET NULL,
+    stars BIGINT NOT NULL CHECK (stars > 0),
+    amount_rub NUMERIC(12, 2) NOT NULL CHECK (amount_rub >= 0),
+    status TEXT NOT NULL DEFAULT 'completed',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
+);
+"""
+
+
+class Database:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+        self.pool: asyncpg.Pool | None = None
+
+    async def connect(self) -> None:
+        self.pool = await asyncpg.create_pool(self.settings.database_url)
+
+    async def close(self) -> None:
+        if self.pool:
+            await self.pool.close()
+
+    async def init_schema(self) -> None:
+        async with self._pool().acquire() as conn:
+            await conn.execute(SCHEMA_SQL)
+            await self._seed_products(conn)
+
+    async def ensure_user(self, telegram_id: int, username: str | None, full_name: str, is_admin: bool) -> asyncpg.Record:
+        return await self._pool().fetchrow(
+            """
+            INSERT INTO users (telegram_id, username, full_name, is_admin)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (telegram_id) DO UPDATE SET
+                username = EXCLUDED.username,
+                full_name = EXCLUDED.full_name,
+                is_admin = EXCLUDED.is_admin,
+                updated_at = NOW()
+            RETURNING *
+            """,
+            telegram_id,
+            username,
+            full_name,
+            is_admin,
+        )
+
+    async def get_user(self, telegram_id: int) -> asyncpg.Record | None:
+        return await self._pool().fetchrow("SELECT * FROM users WHERE telegram_id = $1", telegram_id)
+
+    async def create_payment(self, user_id: int, amount: Decimal) -> asyncpg.Record:
+        return await self._pool().fetchrow(
+            """
+            INSERT INTO payments (user_id, amount_rub)
+            VALUES ($1, $2)
+            RETURNING *
+            """,
+            user_id,
+            amount,
+        )
+
+    async def list_pending_payments(self, limit: int = 10) -> list[asyncpg.Record]:
+        return await self._pool().fetch(
+            """
+            SELECT p.*, u.username, u.full_name
+            FROM payments p
+            JOIN users u ON u.telegram_id = p.user_id
+            WHERE p.status = 'pending'
+            ORDER BY p.created_at
+            LIMIT $1
+            """,
+            limit,
+        )
+
+    async def set_payment_status(self, payment_id: int, status: str) -> asyncpg.Record | None:
+        if status not in {"paid", "cancelled"}:
+            raise ValueError("Unsupported payment status")
+
+        async with self._pool().acquire() as conn:
+            async with conn.transaction():
+                payment = await conn.fetchrow(
+                    "SELECT * FROM payments WHERE id = $1 AND status = 'pending' FOR UPDATE",
+                    payment_id,
+                )
+                if not payment:
+                    return None
+
+                if status == "paid":
+                    await conn.execute(
+                        """
+                        UPDATE users
+                        SET balance = balance + $1, updated_at = NOW()
+                        WHERE telegram_id = $2
+                        """,
+                        payment["amount_rub"],
+                        payment["user_id"],
+                    )
+
+                return await conn.fetchrow(
+                    """
+                    UPDATE payments
+                    SET status = $2, paid_at = CASE WHEN $2 = 'paid' THEN NOW() ELSE paid_at END
+                    WHERE id = $1
+                    RETURNING *
+                    """,
+                    payment_id,
+                    status,
+                )
+
+    async def get_products(self) -> list[asyncpg.Record]:
+        return await self._pool().fetch("SELECT * FROM products WHERE is_active ORDER BY stars")
+
+    async def get_product_by_stars(self, stars: int) -> asyncpg.Record | None:
+        return await self._pool().fetchrow(
+            "SELECT * FROM products WHERE stars = $1 AND is_active",
+            stars,
+        )
+
+    async def buy_stars(
+        self,
+        user_id: int,
+        stars: int,
+        amount: Decimal,
+        product_id: int | None = None,
+    ) -> tuple[bool, asyncpg.Record | None]:
+        async with self._pool().acquire() as conn:
+            async with conn.transaction():
+                user = await conn.fetchrow(
+                    "SELECT * FROM users WHERE telegram_id = $1 FOR UPDATE",
+                    user_id,
+                )
+                if not user or user["balance"] < amount:
+                    return False, user
+
+                await conn.execute(
+                    """
+                    UPDATE users
+                    SET balance = balance - $1,
+                        purchased_stars = purchased_stars + $2,
+                        updated_at = NOW()
+                    WHERE telegram_id = $3
+                    """,
+                    amount,
+                    stars,
+                    user_id,
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO buyers (user_id, product_id, stars, amount_rub)
+                    VALUES ($1, $2, $3, $4)
+                    """,
+                    user_id,
+                    product_id,
+                    stars,
+                    amount,
+                )
+                updated_user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_id)
+                return True, updated_user
+
+    async def stats(self) -> dict[str, Any]:
+        row = await self._pool().fetchrow(
+            """
+            SELECT
+                (SELECT COUNT(*) FROM users) AS users_count,
+                (SELECT COALESCE(SUM(amount_rub), 0) FROM payments WHERE status = 'paid') AS paid_amount,
+                (SELECT COALESCE(SUM(stars), 0) FROM buyers WHERE status = 'completed') AS sold_stars,
+                (SELECT COALESCE(SUM(amount_rub), 0) FROM buyers WHERE status = 'completed') AS sold_amount,
+                (SELECT COUNT(*) FROM payments WHERE status = 'pending') AS pending_payments
+            """
+        )
+        return dict(row)
+
+    async def _seed_products(self, conn: asyncpg.Connection) -> None:
+        price = Decimal(str(self.settings.price_per_star_rub))
+        products = [
+            ("1000 звезд", 1000, price * Decimal(1000)),
+            ("10000 звезд", 10000, price * Decimal(10000)),
+        ]
+        await conn.executemany(
+            """
+            INSERT INTO products (title, stars, price_rub)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (stars) DO UPDATE SET
+                title = EXCLUDED.title,
+                price_rub = EXCLUDED.price_rub,
+                is_active = TRUE
+            """,
+            products,
+        )
+
+    def _pool(self) -> asyncpg.Pool:
+        if not self.pool:
+            raise RuntimeError("Database pool is not initialized")
+        return self.pool

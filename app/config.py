@@ -1,0 +1,57 @@
+from __future__ import annotations
+
+import os
+from dataclasses import dataclass
+from functools import lru_cache
+from pathlib import Path
+
+
+def _read_env_file(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+
+    values: dict[str, str] = {}
+    for raw_line in path.read_text(encoding="utf-8").splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        values[key.strip()] = value.strip().strip('"').strip("'")
+    return values
+
+
+def _env(name: str, file_values: dict[str, str], default: str | None = None) -> str:
+    value = os.getenv(name, file_values.get(name, default))
+    if value is None or (value == "" and default is None):
+        raise RuntimeError(f"Environment variable {name} is required")
+    return value
+
+
+@dataclass(frozen=True)
+class Settings:
+    bot_token: str
+    database_url: str
+    admin_ids: str = ""
+    support_username: str = "123"
+    price_per_star_rub: float = 1.5
+
+    @property
+    def admin_id_set(self) -> set[int]:
+        ids: set[int] = set()
+        for raw_id in self.admin_ids.split(","):
+            raw_id = raw_id.strip()
+            if raw_id:
+                ids.add(int(raw_id))
+        return ids
+
+
+@lru_cache
+def get_settings() -> Settings:
+    file_values = _read_env_file(Path(".env"))
+    return Settings(
+        bot_token=_env("BOT_TOKEN", file_values),
+        database_url=_env("DATABASE_URL", file_values),
+        admin_ids=_env("ADMIN_IDS", file_values, ""),
+        support_username=_env("SUPPORT_USERNAME", file_values, "123"),
+        price_per_star_rub=float(_env("PRICE_PER_STAR_RUB", file_values, "1.5")),
+    )
