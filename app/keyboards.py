@@ -1,21 +1,21 @@
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, KeyboardButton, ReplyKeyboardMarkup
 
 
-BUY_STARS = "Купить звезды"
-TOP_UP = "Пополнить баланс"
-PROFILE = "Профиль"
-HELP = "Помощь"
-BACK = "НАЗАД"
+BUY_STARS = "⭐ Купить звезды"
+TOP_UP = "💰 Пополнить баланс"
+PROFILE = "👤 Профиль"
+HELP = "🛟 Помощь"
+BACK = "◀️Назад"
 
-MONEY_TO_STARS = "⭐ по количеству 💰"
-STARS_TO_MONEY = "💰 по количеству ⭐"
+MONEY_TO_STARS = "⭐ по количеству 💵"
+STARS_TO_MONEY = "💵 по количеству ⭐"
 BUY_1000 = "1000 ⭐"
 BUY_10000 = "10000 ⭐"
-ADMIN_PANEL = "Админ панель"
-ADMIN_STATS = "Статистика"
-ADMIN_PENDING_PAYMENTS = "Ожидают оплаты"
-ADMIN_PRODUCTS = "Список товаров"
-MAIN_MENU = "Главное меню"
+ADMIN_PANEL = "👮‍♀️ Админ панель"
+ADMIN_STATS = "📝 Статистика"
+ADMIN_PENDING_PAYMENTS = "⏳ Ожидают оплаты"
+ADMIN_PRODUCTS = "📋Список товаров"
+MAIN_MENU = "🏠Главное меню"
 
 
 def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:

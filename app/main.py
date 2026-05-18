@@ -37,9 +37,8 @@ from app.keyboards import (
     buy_menu,
     main_menu,
     payment_admin_keyboard,
-    support_keyboard,
 )
-from app.states import ConvertStates
+from app.states import ConvertStates, TopUpStates
 
 
 router = Router()
@@ -62,9 +61,10 @@ def parse_positive_decimal(text: str) -> Decimal | None:
         amount = Decimal(normalized)
     except InvalidOperation:
         return None
+    amount = amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
     if amount <= 0:
         return None
-    return amount.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    return amount
 
 
 def get_db(_: Message | CallbackQuery) -> Database:
@@ -163,7 +163,7 @@ async def ask_money_to_stars(message: Message, state: FSMContext) -> None:
         message,
         state,
         "💰 Введите сумму в рублях, и я посчитаю, сколько ⭐ получится купить.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=back_menu(),
     )
 
 
@@ -179,7 +179,7 @@ async def convert_money_to_stars(message: Message, state: FSMContext) -> None:
             message,
             state,
             "Введите положительную сумму числом, например: <b>1500</b>.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=back_menu(),
         )
         return
 
@@ -203,7 +203,7 @@ async def ask_stars_to_money(message: Message, state: FSMContext) -> None:
         message,
         state,
         "⭐ Введите количество звезд, и я посчитаю стоимость в 💰.",
-        reply_markup=ReplyKeyboardRemove(),
+        reply_markup=back_menu(),
     )
 
 
@@ -220,11 +220,11 @@ async def convert_stars_to_money(message: Message, state: FSMContext) -> None:
             message,
             state,
             "Введите количество звезд целым числом, например: <b>1000</b>.",
-            reply_markup=ReplyKeyboardRemove(),
+            reply_markup=back_menu(),
         )
         return
     if stars <= 0:
-        await send_page(message, state, "Количество звезд должно быть больше нуля.", reply_markup=ReplyKeyboardRemove())
+        await send_page(message, state, "Количество звезд должно быть больше нуля.", reply_markup=back_menu())
         return
 
     price = get_price_per_star(message)
@@ -281,13 +281,41 @@ async def buy_fixed_pack(message: Message, state: FSMContext) -> None:
 async def top_up(message: Message, state: FSMContext) -> None:
     await clear_flow_state(state)
     await ensure_current_user(message)
-    if SETTINGS is None:
-        raise RuntimeError("Settings are not initialized")
+    await state.set_state(TopUpStates.waiting_amount)
     await send_page(
         message,
         state,
-        "💰 Для пополнения баланса напишите в поддержку.",
-        reply_markup=support_keyboard(SETTINGS.support_username),
+        "💰 Введите сумму пополнения в рублях. После заявки администратор сможет подтвердить оплату.",
+        reply_markup=back_menu(),
+    )
+
+
+@router.message(TopUpStates.waiting_amount)
+async def create_top_up_request(message: Message, state: FSMContext) -> None:
+    if message.text == BACK:
+        await show_main_menu(message, state)
+        return
+
+    user = await ensure_current_user(message)
+    amount = parse_positive_decimal(message.text or "")
+    if amount is None:
+        await send_page(
+            message,
+            state,
+            "Введите положительную сумму числом, например: <b>1500</b>.",
+            reply_markup=back_menu(),
+        )
+        return
+
+    payment = await get_db(message).create_payment(user["telegram_id"], amount)
+    await clear_flow_state(state)
+    await send_page(
+        message,
+        state,
+        f"✅ Заявка на пополнение <b>#{payment['id']}</b> создана.\n"
+        f"Сумма: <b>{money(amount)} ₽</b>\n\n"
+        "После проверки администратор зачислит баланс.",
+        reply_markup=main_menu(user["is_admin"]),
     )
 
 
@@ -302,7 +330,7 @@ async def profile(message: Message, state: FSMContext) -> None:
         f"Username: <b>{user_link(user['username'])}</b>\n"
         f"Баланс: <b>{money(user['balance'])} ₽</b>\n"
         f"Куплено звезд: <b>{user['purchased_stars']}</b>",
-        reply_markup=main_menu(user["is_admin"]),
+        reply_markup=back_menu(),
     )
 
 
@@ -421,8 +449,17 @@ async def payment_action(callback: CallbackQuery) -> None:
         user_text = f"❌ Пополнение #{payment['id']} отклонено. Если это ошибка, напишите в поддержку."
 
     if callback.message:
-        await callback.message.edit_text(text)
-    await callback.bot.send_message(payment["user_id"], user_text)
+        try:
+            await callback.message.edit_text(text)
+        except TelegramBadRequest:
+            pass
+
+    try:
+        await callback.bot.send_message(payment["user_id"], user_text)
+    except (TelegramBadRequest, TelegramForbiddenError):
+        await callback.answer("Готово, но пользователь недоступен", show_alert=True)
+        return
+
     await callback.answer("Готово")
 
 
