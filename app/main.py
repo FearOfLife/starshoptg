@@ -10,7 +10,7 @@ from aiogram.enums import ParseMode
 from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError
 from aiogram.filters import CommandStart
 from aiogram.fsm.context import FSMContext
-from aiogram.types import CallbackQuery, Message
+from aiogram.types import CallbackQuery, InlineKeyboardButton, Message
 from aiogram.types import ReplyKeyboardRemove
 from aiogram.types.reply_keyboard_markup import ReplyKeyboardMarkup
 from aiogram.types.inline_keyboard_markup import InlineKeyboardMarkup
@@ -44,6 +44,7 @@ from app.states import ConvertStates, TopUpStates
 router = Router()
 SETTINGS: Settings | None = None
 DB: Database | None = None
+CUSTOM_BUY_PREFIX = "buy_custom:"
 
 
 def money(value: Decimal | int | float) -> str:
@@ -77,6 +78,20 @@ def get_price_per_star(_: Message | CallbackQuery) -> Decimal:
     if SETTINGS is None:
         raise RuntimeError("Settings are not initialized")
     return Decimal(str(SETTINGS.price_per_star_rub))
+
+
+def custom_buy_keyboard(stars: int, amount: Decimal) -> InlineKeyboardMarkup:
+    amount_cents = int(amount * 100)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=f"Купить {stars} ⭐",
+                    callback_data=f"{CUSTOM_BUY_PREFIX}{stars}:{amount_cents}",
+                )
+            ]
+        ]
+    )
 
 
 async def delete_safely(bot: Bot, chat_id: int, message_id: int | None) -> None:
@@ -185,13 +200,22 @@ async def convert_money_to_stars(message: Message, state: FSMContext) -> None:
 
     price = get_price_per_star(message)
     stars = int(amount / price)
+    if stars <= 0:
+        await send_page(
+            message,
+            state,
+            f"Этой суммы не хватает на 1 ⭐.\nКурс: <b>{money(price)} ₽</b> за 1 ⭐",
+            reply_markup=back_menu(),
+        )
+        return
+
     await clear_flow_state(state)
     await send_page(
         message,
         state,
         f"За <b>{money(amount)} ₽</b> получится купить примерно <b>{stars}</b> ⭐\n"
         f"Курс: <b>{money(price)} ₽</b> за 1 ⭐",
-        reply_markup=buy_menu(),
+        reply_markup=custom_buy_keyboard(stars, amount),
     )
 
 
@@ -235,7 +259,7 @@ async def convert_stars_to_money(message: Message, state: FSMContext) -> None:
         state,
         f"<b>{stars}</b> ⭐ стоят <b>{money(amount)} ₽</b>\n"
         f"Курс: <b>{money(price)} ₽</b> за 1 ⭐",
-        reply_markup=buy_menu(),
+        reply_markup=custom_buy_keyboard(stars, amount),
     )
 
 
@@ -275,6 +299,58 @@ async def buy_fixed_pack(message: Message, state: FSMContext) -> None:
         f"Баланс: <b>{money(updated_user['balance'])} ₽</b>",
         reply_markup=main_menu(user["is_admin"]),
     )
+
+
+@router.callback_query(F.data.startswith(CUSTOM_BUY_PREFIX))
+async def buy_custom_pack(callback: CallbackQuery) -> None:
+    if SETTINGS is None:
+        raise RuntimeError("Settings are not initialized")
+
+    try:
+        raw_stars, raw_amount_cents = callback.data.removeprefix(CUSTOM_BUY_PREFIX).split(":", 1)
+        stars = int(raw_stars)
+        amount = (Decimal(int(raw_amount_cents)) / Decimal(100)).quantize(Decimal("0.01"))
+    except (AttributeError, ValueError, InvalidOperation):
+        await callback.answer("Некорректная покупка", show_alert=True)
+        return
+
+    if stars <= 0 or amount <= 0:
+        await callback.answer("Некорректная покупка", show_alert=True)
+        return
+
+    from_user = callback.from_user
+    user = await get_db(callback).ensure_user(
+        telegram_id=from_user.id,
+        username=from_user.username,
+        full_name=from_user.full_name,
+        is_admin=from_user.id in SETTINGS.admin_id_set,
+    )
+    success, updated_user = await get_db(callback).buy_stars(
+        user_id=user["telegram_id"],
+        stars=stars,
+        amount=amount,
+    )
+    if not success:
+        current_balance = updated_user["balance"] if updated_user else Decimal("0")
+        if callback.message:
+            await callback.message.edit_text(
+                "На балансе недостаточно средств.\n"
+                f"Цена: <b>{money(amount)} ₽</b>\n"
+                f"Ваш баланс: <b>{money(current_balance)} ₽</b>",
+                reply_markup=custom_buy_keyboard(stars, amount),
+            )
+        await callback.answer("Недостаточно средств", show_alert=True)
+        return
+
+    if callback.message:
+        await callback.message.edit_text(
+            f"✅ Покупка выполнена!\n\n"
+            f"Начислено: <b>{stars}</b> ⭐\n"
+            f"Списано: <b>{money(amount)} ₽</b>\n"
+            f"Баланс: <b>{money(updated_user['balance'])} ₽</b>"
+        )
+        await callback.message.answer("Выберите действие в меню ниже.", reply_markup=main_menu(user["is_admin"]))
+    await callback.answer("Готово")
 
 
 @router.message(F.text == TOP_UP)
