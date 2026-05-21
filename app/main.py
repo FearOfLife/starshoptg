@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
 import logging
 from decimal import Decimal, InvalidOperation, ROUND_DOWN, ROUND_HALF_UP
 from pathlib import Path
@@ -26,6 +28,9 @@ from app.keyboards import (
     ADMIN_PRODUCTS,
     ADMIN_STATS,
     BACK,
+    BUY_CATEGORY_BACK_CALLBACK,
+    BUY_CATEGORY_PREMIUM,
+    BUY_CATEGORY_STARS,
     BUY_STARS,
     BUY_STARS_TEXTS,
     HELP,
@@ -38,6 +43,9 @@ from app.keyboards import (
     MONEY_OPTION_LABELS,
     MONEY_TO_STARS,
     ORDER_OPTION_LABELS,
+    PREMIUM_3_MONTHS,
+    PREMIUM_6_MONTHS,
+    PREMIUM_12_MONTHS,
     PROFILE,
     PROFILE_BACK_CALLBACK,
     PROFILE_TOP_UP,
@@ -51,11 +59,13 @@ from app.keyboards import (
     main_menu,
     money_amount_menu,
     payment_admin_keyboard,
+    premium_months_menu,
     profile_menu,
+    stars_buy_menu,
     stars_amount_menu,
     top_up_amount_menu,
 )
-from app.states import ConvertStates, TopUpStates
+from app.states import ConvertStates, PurchaseStates, TopUpStates
 
 
 router = Router()
@@ -66,6 +76,8 @@ PROJECT_ROOT = Path(__file__).resolve().parent.parent
 IMG_DIR = PROJECT_ROOT / "img"
 WELCOME_IMAGE = IMG_DIR / "Приветствую.png"
 BUY_CATEGORY_IMAGE = IMG_DIR / "Выберите категорию.png"
+BUY_STARS_IMAGE = IMG_DIR / "Звёзды.png"
+PREMIUM_IMAGE = IMG_DIR / "Премиум.png"
 HELP_IMAGE = IMG_DIR / "Помощь.png"
 PROFILE_IMAGE = IMG_DIR / "Профиль.png"
 
@@ -73,6 +85,11 @@ ORDER_PAY_PREFIX = "order_pay:"
 ORDER_METHODS_PREFIX = "order_methods:"
 ORDER_CRYPTO_PREFIX = "order_crypto:"
 ORDER_BACK_PREFIX = "order_back:"
+PREMIUM_ORDER_PREFIX = "premium_order:"
+PREMIUM_METHODS_PREFIX = "premium_methods:"
+PREMIUM_CRYPTO_PREFIX = "premium_crypto:"
+PREMIUM_PAY_PREFIX = "premium_pay:"
+PREMIUM_BACK_PREFIX = "premium_back:"
 PAY_WAIT_PREFIX = "pay_wait:"
 PAY_DONE_PREFIX = "pay_done:"
 TOPUP_METHODS_PREFIX = "topup_methods:"
@@ -123,6 +140,16 @@ def parse_positive_decimal(text: str) -> Decimal | None:
     return amount
 
 
+def parse_username(text: str) -> str | None:
+    username = text.strip().removeprefix("@")
+    if not username or len(username) > 32:
+        return None
+    allowed = username.replace("_", "")
+    if not allowed.isalnum() or len(username) < 5:
+        return None
+    return username
+
+
 def price_for_stars(stars: int) -> Decimal:
     return (Decimal(stars) * STAR_PRICE_RUB).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
 
@@ -155,6 +182,33 @@ def decode_order(data: str) -> tuple[int, Decimal]:
     if stars <= 0 or amount <= 0:
         raise ValueError("Bad order data")
     return stars, amount
+
+
+def premium_price(months: int) -> Decimal:
+    settings = get_settings_ready()
+    prices = {
+        3: Decimal(str(settings.premium_3_months_rub)),
+        6: Decimal(str(settings.premium_6_months_rub)),
+        12: Decimal(str(settings.premium_12_months_rub)),
+    }
+    try:
+        return prices[months].quantize(Decimal("0.01"))
+    except KeyError as exc:
+        raise ValueError("Unsupported premium period") from exc
+
+
+def encode_premium_order(months: int, amount: Decimal | int) -> str:
+    cents = int(Decimal(amount) * 100)
+    return f"{months}:{cents}"
+
+
+def decode_premium_order(data: str) -> tuple[int, Decimal]:
+    raw_months, raw_cents = data.split(":", 1)
+    months = int(raw_months)
+    amount = (Decimal(int(raw_cents)) / Decimal(100)).quantize(Decimal("0.01"))
+    if months not in {3, 6, 12} or amount <= 0:
+        raise ValueError("Bad premium order data")
+    return months, amount
 
 
 async def ensure_current_user(message: Message):
@@ -206,7 +260,7 @@ async def send_photo_page(
         await message.answer_photo(FSInputFile(photo_path))
         return await send_page(message, state, text, reply_markup=reply_markup)
 
-    sent = await message.answer_photo(FSInputFile(photo_path), caption=text, reply_markup=reply_markup)
+    sent = await message.answer_photo(FSInputFile(photo_path), caption=text or None, reply_markup=reply_markup)
     await state.update_data(page_message_id=sent.message_id)
     return sent
 
@@ -230,9 +284,54 @@ async def edit_inline_message(
             await callback.message.answer(text, reply_markup=reply_markup)
 
 
+async def replace_callback_message_with_text(
+    callback: CallbackQuery,
+    text: str,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    if not callback.message:
+        return
+
+    if callback.message.photo:
+        try:
+            await callback.message.delete()
+        except TelegramBadRequest:
+            await edit_inline_message(callback, text, reply_markup=reply_markup)
+            return
+        await callback.message.answer(text, reply_markup=reply_markup)
+        return
+
+    await edit_inline_message(callback, text, reply_markup=reply_markup)
+
+
+async def send_photo_from_callback(
+    callback: CallbackQuery,
+    state: FSMContext,
+    text: str,
+    photo_path: Path,
+    reply_markup: InlineKeyboardMarkup | None = None,
+) -> None:
+    await clear_flow_state(state)
+    await ensure_callback_user(callback)
+    if not callback.message:
+        return
+
+    try:
+        await callback.message.delete()
+    except TelegramBadRequest:
+        pass
+
+    if not photo_path.exists():
+        logging.warning("Page image not found: %s", photo_path)
+        sent = await callback.message.answer(text, reply_markup=reply_markup)
+    else:
+        sent = await callback.message.answer_photo(FSInputFile(photo_path), caption=text or None, reply_markup=reply_markup)
+    await state.update_data(page_message_id=sent.message_id)
+
+
 def welcome_text() -> str:
     return (
-        f"{premium_emoji('5343984088493599366', '👋')} <b>Fear, привет!</b> Бот работает в автоматическом режиме!\n\n"
+        f"{premium_emoji('5343984088493599366', '👋')} Бот работает в автоматическом режиме!\n\n"
         f"Рекомендуем сначала заглянуть в раздел «{premium_emoji('5289733171166862088', '🆘')}Помощь», "
         "а потом совершать покупки в любое время суток!"
     )
@@ -240,10 +339,32 @@ def welcome_text() -> str:
 
 def buy_stars_text() -> str:
     return (
-        "» <b>\"По количеству 🕯\"</b>:\n"
-        "- выбрать ровное количество звезд, например 100, 200, 350 и т.д.\n"
-        "» <b>\"По количеству 💸\"</b>:\n"
-        "- выбрать звезд на ровную сумму рублей, например 100, 250, 500 и т.д."
+        f"{premium_emoji('5456327792868220208', '➡️')} <b>По количеству {premium_emoji('5458501939673192257', '⭐')}</b>:\n"
+        "- Указать на какую сумму вы хотите приобрести звёзд.\n"
+        f"{premium_emoji('5456327792868220208', '➡️')} <b>По количеству {premium_emoji('5463289097336405244', '💵')}</b>:\n"
+        "- Указать, какое количество звёзд вы хотите приобрести."
+    )
+
+
+def buy_category_text() -> str:
+    return "<b>Выберите категорию</b>"
+
+
+def premium_text() -> str:
+    return (
+        f"<b>{premium_emoji('5348177037431414677', '⚠️')}"
+        f"Отправить премиум можно будет только тем, у кого нет действующей подписки"
+        f"{premium_emoji('5348177037431414677', '⚠️')}</b>"
+    )
+
+
+def premium_order_text(months: int, amount: Decimal) -> str:
+    return (
+        f"{premium_emoji('5456327792868220208', '➡️')} Вы покупаете: <b>Telegram Premium {premium_emoji('5260725503215543617', '🎁')} на {months} мес.</b>\n\n"
+        f"{premium_emoji('5201873447554145566', '💵')} Цена: <b>{money(amount)} р.</b>\n\n"
+        f"{premium_emoji('5447644880824181073', '⚠️')} После оплаты дождитесь уведомления "
+        f"\"{premium_emoji('5364035134725043602', '✅')} Оплата прошла успешно!\" и укажите @username аккаунта, "
+        "которому будет отправлен premium."
     )
 
 
@@ -260,7 +381,7 @@ def order_text(stars: int, amount: Decimal) -> str:
         f"» Вы покупаете: <b>{stars} • {money(amount)} р.</b>\n\n"
         f"💵 Цена: <b>{money(amount)} р.</b>\n\n"
         "⚠️ После оплаты дождитесь уведомления "
-        "\"✅ Оплата прошла успешно!\" и укажите @username аккаунта, "
+        f"\"{premium_emoji('5364035134725043602', '✅')} Оплата прошла успешно!\" и укажите @username аккаунта, "
         "которому будут отправлены звёзды / premium"
     )
 
@@ -276,27 +397,40 @@ def payment_methods_text() -> str:
 
 
 def top_up_text() -> str:
-    return f"{premium_emoji('5415594207068822547', '💰')} <b>Пополнение баланса</b>\n\nВведите сумму пополнения:"
+    return f"{premium_emoji('5415594207068822547', '💰')} <b>Пополнение баланса</b>\n\nВыберите сумму пополнения"
 
 
 def top_up_order_text(amount: Decimal) -> str:
     return (
         f"» Вы пополняете баланс на: <b>{money(amount)} р.</b>\n\n"
-        f"💵 Сумма: <b>{money(amount)} р.</b>\n\n"
-        "⚠️ После оплаты дождитесь уведомления "
-        "\"✅ Оплата прошла успешно!\" и нажмите кнопку «Я оплатил»."
+        f"{premium_emoji('5201873447554145566', '💵')} Сумма: <b>{money(amount)} р.</b>\n\n"
+        f"{premium_emoji('5447644880824181073', '⚠️')} После оплаты дождитесь уведомления "
+        f"\"{premium_emoji('5364035134725043602', '✅')} Оплата прошла успешно!\" и нажмите кнопку «Я оплатил»."
     )
 
 
 def top_up_invoice_text(amount: Decimal, invoice_id: int) -> str:
     return (
         "━━━━━━━━━━━━━━━━━━━━\n"
-        f"💰 Пополнение баланса: <b>{money(amount)} р.</b>\n"
-        f"#️⃣ Номер заказа: <code>{invoice_id}</code>\n"
+        f"{premium_emoji('5201873447554145566', '💵')} Пополнение баланса: <b>{money(amount)} р.</b>\n"
+        f"{premium_emoji('5393380168062485238', '💎')} Номер заказа: <code>{invoice_id}</code>\n"
         "━━━━━━━━━━━━━━━━━━━━\n"
         "Для оплаты перейдите по ссылке!\n"
-        "🕘 Время на оплату: <b>30 минут</b>\n"
-        "⚠️ Необходимо оплатить до окончания таймера\n"
+        f"{premium_emoji('5397677845482849272', '🕘')} Время на оплату: <b>30 минут</b>\n"
+        f"{premium_emoji('5447644880824181073', '⚠️')} Необходимо оплатить до окончания таймера\n"
+        "━━━━━━━━━━━━━━━━━━━━"
+    )
+
+
+def premium_invoice_text(months: int, amount: Decimal, invoice_id: int) -> str:
+    return (
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        f"{premium_emoji('5312361253610475399', '🎖️')} Telegram Premium: <b>{months} мес. • {money(amount)} р.</b>\n"
+        f"{premium_emoji('5393380168062485238', '💎')} Номер заказа: <code>{invoice_id}</code>\n"
+        "━━━━━━━━━━━━━━━━━━━━\n"
+        "Для оплаты перейдите по ссылке!\n"
+        f"{premium_emoji('5397677845482849272', '🕘')} Время на оплату: <b>30 минут</b>\n"
+        f"{premium_emoji('5447644880824181073', '⚠️')} Необходимо оплатить до окончания таймера\n"
         "━━━━━━━━━━━━━━━━━━━━"
     )
 
@@ -324,7 +458,7 @@ def help_text() -> str:
         "» Жмите «Перейти к оплате»\n"
         "» Выбираете метод оплаты\n"
         "» Оплачиваете по ссылке\n"
-        "» Ждёте уведомления в боте - \"✅ Оплата прошла успешно!\"\n"
+        f"» Ждёте уведомления в боте - \"{premium_emoji('5364035134725043602', '✅')} Оплата прошла успешно!\"\n"
         "➡️ Кому отправить? Укажите @username!\n"
         "» Укажите @username аккаунта, которому будут отправлены звёзды!\n\n"
         "━━━━━━━━━━━━━━━━━━━━\n\n"
@@ -354,7 +488,7 @@ def info_text() -> str:
 
 def welcome_text() -> str:
     return (
-        f"{premium_emoji('5343984088493599366', '👋')} <b>Fear, привет!</b> Бот работает в автоматическом режиме!\n\n"
+        f"{premium_emoji('5343984088493599366', '👋')} Бот работает в автоматическом режиме!\n\n"
         f"Рекомендуем сначала заглянуть в раздел «{premium_emoji('5289733171166862088', '🆘')}Помощь», "
         "а потом совершать покупки в любое время суток!"
     )
@@ -362,31 +496,28 @@ def welcome_text() -> str:
 
 def buy_stars_text() -> str:
     return (
-        "———————\n\n"
-        f"{premium_emoji('5456327792868220208', '➡️')} <b>По количеству {premium_emoji('5463289097336405244', '⭐')}</b>:\n"
-        "- Указать, какое количество звёзд вы хотите приобрести.\n"
-        f"{premium_emoji('5456327792868220208', '➡️')} <b>По количеству {premium_emoji('5201873447554145566', '💵')}</b>:\n"
-        "- Указать на какую сумму вы хотите приобрести звёзд."
+        f"{premium_emoji('5456327792868220208', '➡️')} <b>По количеству {premium_emoji('5458501939673192257', '⭐')}</b>:\n"
+        "- Указать на какую сумму вы хотите приобрести звёзд.\n"
+        f"{premium_emoji('5456327792868220208', '➡️')} <b>По количеству {premium_emoji('5463289097336405244', '💵')}</b>:\n"
+        "- Указать, какое количество звёзд вы хотите приобрести."
     )
 
 
 def stars_menu_text() -> str:
     return (
-        f"{premium_emoji('5463289097336405244', '⭐')} <b>Укажите количество звёзд</b>\n\n"
-        "Введите количество звёзд числом, например: <code>800</code>."
+        f"{premium_emoji('5201873447554145566', '💵')} <b>Укажите сумму</b>\n\n"
     )
 
 
 def money_menu_text() -> str:
     return (
-        f"{premium_emoji('5201873447554145566', '💵')} <b>Укажите сумму</b>\n\n"
-        "Введите сумму в рублях числом, например: <code>1168</code>."
+        f"{premium_emoji('5463289097336405244', '⭐')} <b>Укажите количество звёзд</b>\n\n"
     )
 
 
 def order_text(stars: int, amount: Decimal) -> str:
     return (
-        f"{premium_emoji('5456327792868220208', '➡️')} Вы покупаете: <b>{stars} • {money(amount)} р.</b>\n\n"
+        f"{premium_emoji('5456327792868220208', '➡️')} Вы покупаете: <b>{stars} {premium_emoji('5947363097353130662', '⭐')} • {money(amount)} р.</b>\n\n"
         f"{premium_emoji('5201873447554145566', '💵')} Цена: <b>{money(amount)} р.</b>\n\n"
         f"{premium_emoji('5447644880824181073', '⚠️')} После оплаты дождитесь уведомления "
         f"\"{premium_emoji('5364035134725043602', '✅')} Оплата прошла успешно!\" и укажите @username аккаунта, "
@@ -454,6 +585,53 @@ def order_keyboard(stars: int, amount: Decimal) -> InlineKeyboardMarkup:
                 InlineKeyboardButton(
                     text="Назад",
                     callback_data=f"{ORDER_BACK_PREFIX}{encoded}",
+                    icon_custom_emoji_id="5255703720078879038",
+                    style="danger",
+                )
+            ],
+        ]
+    )
+
+
+def premium_order_keyboard(months: int, amount: Decimal) -> InlineKeyboardMarkup:
+    encoded = encode_premium_order(months, amount)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="Перейти к оплате",
+                    callback_data=f"{PREMIUM_METHODS_PREFIX}{encoded}",
+                    icon_custom_emoji_id="5317013291602553603",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Назад",
+                    callback_data=f"{PREMIUM_BACK_PREFIX}{encoded}",
+                    icon_custom_emoji_id="5255703720078879038",
+                    style="danger",
+                )
+            ],
+        ]
+    )
+
+
+def premium_payment_methods_keyboard(months: int, amount: Decimal) -> InlineKeyboardMarkup:
+    encoded = encode_premium_order(months, amount)
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text="CryptoBot",
+                    callback_data=f"{PREMIUM_CRYPTO_PREFIX}{encoded}",
+                    icon_custom_emoji_id="5361836987642815474",
+                    style="primary",
+                )
+            ],
+            [
+                InlineKeyboardButton(
+                    text="Назад",
+                    callback_data=f"{PREMIUM_PAY_PREFIX}{encoded}",
                     icon_custom_emoji_id="5255703720078879038",
                     style="danger",
                 )
@@ -569,6 +747,70 @@ async def crypto_request(method: str, payload: dict[str, Any]) -> dict[str, Any]
     return data["result"]
 
 
+async def istar_request(
+    method: str,
+    path: str,
+    *,
+    params: dict[str, Any] | None = None,
+    json: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    settings = get_settings_ready()
+    if not settings.istar_api_key:
+        raise RuntimeError("ISTAR_API_KEY is not configured")
+
+    url = f"{settings.istar_api_url.rstrip('/')}/{path.lstrip('/')}"
+    headers = {"API-Key": settings.istar_api_key}
+    timeout = aiohttp.ClientTimeout(total=30)
+    async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with session.request(method, url, params=params, json=json, headers=headers) as response:
+            data = await response.json(content_type=None)
+            if response.status >= 400:
+                raise RuntimeError(str(data))
+    return data
+
+
+async def get_istar_star_recipient(username: str, quantity: int) -> dict[str, Any]:
+    return await istar_request(
+        "GET",
+        "/star/recipient/search",
+        params={"username": username, "quantity": quantity},
+    )
+
+
+async def create_istar_star_order(username: str, recipient_hash: str, quantity: int) -> dict[str, Any]:
+    return await istar_request(
+        "POST",
+        "/orders/star",
+        json={
+            "username": username,
+            "recipient_hash": recipient_hash,
+            "quantity": quantity,
+            "wallet_type": get_settings_ready().istar_wallet_type,
+        },
+    )
+
+
+async def get_istar_premium_recipient(username: str, months: int) -> dict[str, Any]:
+    return await istar_request(
+        "GET",
+        "/premium/recipient/search",
+        params={"username": username, "months": months},
+    )
+
+
+async def create_istar_premium_order(username: str, recipient_hash: str, months: int) -> dict[str, Any]:
+    return await istar_request(
+        "POST",
+        "/orders/premium",
+        json={
+            "username": username,
+            "recipient_hash": recipient_hash,
+            "months": months,
+            "wallet_type": get_settings_ready().istar_wallet_type,
+        },
+    )
+
+
 async def create_crypto_invoice(user_id: int, amount: Decimal, description: str, payload: str) -> dict[str, Any]:
     return await crypto_request(
         "createInvoice",
@@ -599,12 +841,25 @@ async def health_handler(_: web.Request) -> web.Response:
 
 
 async def istar_webhook_handler(request: web.Request) -> web.Response:
+    body = await request.read()
+    secret = get_settings_ready().istar_webhook_secret
+    if secret:
+        received_signature = request.headers.get("X-iStar-Signature", "")
+        expected_signature = hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(received_signature, expected_signature):
+            return web.json_response({"ok": False, "error": "bad_signature"}, status=401)
+
     try:
         payload = await request.json()
     except Exception:
         return web.json_response({"ok": False, "error": "invalid_json"}, status=400)
 
     logging.info("iStar webhook received: %s", payload)
+    order = payload.get("order") or {}
+    order_id = str(order.get("id") or "")
+    order_status = str(order.get("status") or payload.get("event_type") or "")
+    if order_id and DB is not None:
+        await DB.update_crypto_order_istar_status(order_id, order_status, payload.get("error"))
     return web.json_response({"ok": True})
 
 
@@ -673,6 +928,41 @@ async def show_main_menu(message: Message, state: FSMContext) -> None:
     await send_photo_page(message, state, welcome_text(), WELCOME_IMAGE, reply_markup=main_menu(user["is_admin"]))
 
 
+async def send_main_menu_from_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await clear_flow_state(state)
+    user = await ensure_callback_user(callback)
+    if callback.message:
+        await callback.message.answer_photo(
+            FSInputFile(WELCOME_IMAGE),
+            caption=welcome_text(),
+            reply_markup=main_menu(user["is_admin"]),
+        )
+
+
+async def send_profile_from_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await clear_flow_state(state)
+    user = await ensure_callback_user(callback)
+    stats = await get_db(callback).user_purchase_stats(user["telegram_id"])
+    if callback.message:
+        await callback.message.answer_photo(
+            FSInputFile(PROFILE_IMAGE),
+            caption=profile_text(user, stats),
+            reply_markup=profile_menu(),
+        )
+
+
+async def send_buy_category_from_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await send_photo_from_callback(callback, state, "", BUY_CATEGORY_IMAGE, reply_markup=buy_menu())
+
+
+async def send_stars_category_from_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await send_photo_from_callback(callback, state, buy_stars_text(), BUY_STARS_IMAGE, reply_markup=stars_buy_menu())
+
+
+async def send_premium_category_from_callback(callback: CallbackQuery, state: FSMContext) -> None:
+    await send_photo_from_callback(callback, state, premium_text(), PREMIUM_IMAGE, reply_markup=premium_months_menu())
+
+
 @router.message(CommandStart())
 async def start(message: Message, state: FSMContext) -> None:
     await show_main_menu(message, state)
@@ -682,20 +972,132 @@ async def start(message: Message, state: FSMContext) -> None:
 async def buy_stars_menu(message: Message, state: FSMContext) -> None:
     await clear_flow_state(state)
     await ensure_current_user(message)
-    await send_photo_page(message, state, buy_stars_text(), BUY_CATEGORY_IMAGE, reply_markup=buy_menu())
+    await send_photo_page(message, state, "", BUY_CATEGORY_IMAGE, reply_markup=buy_menu())
+
+
+@router.callback_query(F.data == BUY_CATEGORY_BACK_CALLBACK)
+async def back_to_buy_category(callback: CallbackQuery, state: FSMContext) -> None:
+    await send_buy_category_from_callback(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == BUY_CATEGORY_STARS)
+async def show_stars_buy_menu(callback: CallbackQuery, state: FSMContext) -> None:
+    await send_stars_category_from_callback(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data == BUY_CATEGORY_PREMIUM)
+async def show_premium_stub(callback: CallbackQuery, state: FSMContext) -> None:
+    await send_premium_category_from_callback(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data.in_({PREMIUM_3_MONTHS, PREMIUM_6_MONTHS, PREMIUM_12_MONTHS}))
+async def show_premium_order_summary(callback: CallbackQuery) -> None:
+    months_by_label = {
+        PREMIUM_3_MONTHS: 3,
+        PREMIUM_6_MONTHS: 6,
+        PREMIUM_12_MONTHS: 12,
+    }
+    months = months_by_label[callback.data]
+    amount = premium_price(months)
+    await replace_callback_message_with_text(callback, premium_order_text(months, amount), reply_markup=premium_order_keyboard(months, amount))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith(PREMIUM_BACK_PREFIX))
+async def premium_order_back(callback: CallbackQuery, state: FSMContext) -> None:
+    await send_premium_category_from_callback(callback, state)
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith(PREMIUM_PAY_PREFIX))
+async def back_to_premium_order_summary(callback: CallbackQuery) -> None:
+    try:
+        months, amount = decode_premium_order(callback.data.removeprefix(PREMIUM_PAY_PREFIX))
+    except (AttributeError, ValueError, InvalidOperation):
+        await callback.answer("Некорректный заказ", show_alert=True)
+        return
+    await edit_inline_message(callback, premium_order_text(months, amount), reply_markup=premium_order_keyboard(months, amount))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith(PREMIUM_METHODS_PREFIX))
+async def show_premium_payment_methods(callback: CallbackQuery) -> None:
+    try:
+        months, amount = decode_premium_order(callback.data.removeprefix(PREMIUM_METHODS_PREFIX))
+    except (AttributeError, ValueError, InvalidOperation):
+        await callback.answer("Некорректный заказ", show_alert=True)
+        return
+    await edit_inline_message(callback, payment_methods_text(), reply_markup=premium_payment_methods_keyboard(months, amount))
+    await callback.answer()
+
+
+@router.callback_query(F.data.startswith(PREMIUM_CRYPTO_PREFIX))
+async def show_premium_crypto_invoice(callback: CallbackQuery) -> None:
+    try:
+        months, amount = decode_premium_order(callback.data.removeprefix(PREMIUM_CRYPTO_PREFIX))
+    except (AttributeError, ValueError, InvalidOperation):
+        await callback.answer("Некорректный заказ", show_alert=True)
+        return
+
+    if not get_settings_ready().crypto_bot_token:
+        await edit_inline_message(
+            callback,
+            "CryptoBot пока не подключён.\n\n"
+            "Добавьте токен в `.env`:\n"
+            "<code>CRYPTOBOT_TOKEN=ваш_токен</code>\n\n"
+            "После этого перезапустите бота.",
+            reply_markup=premium_payment_methods_keyboard(months, amount),
+        )
+        await callback.answer("Нужен CRYPTOBOT_TOKEN", show_alert=True)
+        return
+
+    user = await ensure_callback_user(callback)
+    try:
+        invoice = await create_crypto_invoice(
+            user["telegram_id"],
+            amount,
+            f"Telegram Premium {months} months",
+            f"premium:{user['telegram_id']}:{months}:{int(amount * 100)}",
+        )
+    except Exception as exc:
+        logging.exception("CryptoBot premium invoice creation failed")
+        await edit_inline_message(
+            callback,
+            f"Не удалось создать счёт CryptoBot.\n\n<code>{exc}</code>",
+            reply_markup=premium_payment_methods_keyboard(months, amount),
+        )
+        await callback.answer("Ошибка CryptoBot", show_alert=True)
+        return
+
+    invoice_id = int(invoice["invoice_id"])
+    pay_url = invoice.get("bot_invoice_url") or invoice.get("pay_url") or invoice.get("web_app_invoice_url") or ""
+    await get_db(callback).create_crypto_premium_order(user["telegram_id"], invoice_id, months, amount, pay_url)
+    await edit_inline_message(
+        callback,
+        premium_invoice_text(months, amount, invoice_id),
+        reply_markup=invoice_keyboard(pay_url, invoice_id),
+    )
+    if callback.message:
+        asyncio.create_task(
+            mark_invoice_button_when_paid(callback.bot, callback.message.chat.id, callback.message.message_id, invoice_id)
+        )
+    await callback.answer()
 
 
 @router.callback_query(F.data == STARS_TO_MONEY)
 async def choose_by_stars(callback: CallbackQuery, state: FSMContext) -> None:
-    await clear_flow_state(state)
-    await edit_inline_message(callback, stars_menu_text(), reply_markup=stars_amount_menu())
+    await state.set_state(ConvertStates.waiting_stars)
+    await replace_callback_message_with_text(callback, stars_menu_text(), reply_markup=stars_amount_menu())
     await callback.answer()
 
 
 @router.callback_query(F.data == MONEY_TO_STARS)
 async def choose_by_money(callback: CallbackQuery, state: FSMContext) -> None:
-    await clear_flow_state(state)
-    await edit_inline_message(callback, money_menu_text(), reply_markup=money_amount_menu())
+    await state.set_state(ConvertStates.waiting_money)
+    await replace_callback_message_with_text(callback, money_menu_text(), reply_markup=money_amount_menu())
     await callback.answer()
 
 
@@ -709,27 +1111,24 @@ async def show_order_summary(callback: CallbackQuery) -> None:
 
 @router.callback_query(F.data == BUY_MENU_BACK_CALLBACK)
 async def back_to_buy_menu(callback: CallbackQuery, state: FSMContext) -> None:
-    await clear_flow_state(state)
-    await edit_inline_message(callback, buy_stars_text(), reply_markup=buy_menu())
+    await send_stars_category_from_callback(callback, state)
     await callback.answer()
 
 
 @router.callback_query(F.data == MAIN_BACK_CALLBACK)
 async def inline_back_to_main(callback: CallbackQuery, state: FSMContext) -> None:
-    await clear_flow_state(state)
-    await edit_inline_message(callback, welcome_text())
+    await send_main_menu_from_callback(callback, state)
     await callback.answer()
 
 
 @router.callback_query(F.data == PROFILE_BACK_CALLBACK)
 async def inline_back_to_profile(callback: CallbackQuery, state: FSMContext) -> None:
-    await clear_flow_state(state)
-    await edit_inline_message(callback, "Действие отменено.", reply_markup=profile_menu())
+    await send_profile_from_callback(callback, state)
     await callback.answer()
 
 
 @router.callback_query(F.data.startswith(ORDER_BACK_PREFIX))
-async def order_back(callback: CallbackQuery) -> None:
+async def order_back(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         stars, amount = decode_order(callback.data.removeprefix(ORDER_BACK_PREFIX))
     except (AttributeError, ValueError, InvalidOperation):
@@ -742,7 +1141,7 @@ async def order_back(callback: CallbackQuery) -> None:
     elif option in STAR_OPTION_LABELS.values():
         await edit_inline_message(callback, stars_menu_text(), reply_markup=stars_amount_menu())
     else:
-        await edit_inline_message(callback, buy_stars_text(), reply_markup=buy_menu())
+        await send_stars_category_from_callback(callback, state)
     await callback.answer()
 
 
@@ -838,13 +1237,16 @@ async def wait_payment(callback: CallbackQuery) -> None:
     if status != "paid" or not order:
         await callback.answer("Оплата пока не найдена", show_alert=True)
         return
+    if order["user_id"] != callback.from_user.id:
+        await callback.answer("Этот счёт принадлежит другому пользователю", show_alert=True)
+        return
     if callback.message:
         await callback.message.edit_reply_markup(reply_markup=invoice_keyboard(order["pay_url"], invoice_id, paid=True))
     await callback.answer("Оплата найдена")
 
 
 @router.callback_query(F.data.startswith(PAY_DONE_PREFIX))
-async def finish_paid_order(callback: CallbackQuery) -> None:
+async def finish_paid_order(callback: CallbackQuery, state: FSMContext) -> None:
     try:
         invoice_id = int(callback.data.removeprefix(PAY_DONE_PREFIX))
         status = await get_crypto_invoice_status(invoice_id)
@@ -855,18 +1257,32 @@ async def finish_paid_order(callback: CallbackQuery) -> None:
     if status != "paid" or not order:
         await callback.answer("Оплата пока не найдена", show_alert=True)
         return
+    if order["user_id"] != callback.from_user.id:
+        await callback.answer("Этот счёт принадлежит другому пользователю", show_alert=True)
+        return
+    if order["istar_order_id"]:
+        await callback.answer("Заказ уже отправлен в IStars", show_alert=True)
+        return
 
     completed, updated_user = await get_db(callback).complete_crypto_order(invoice_id)
-    if not completed:
+    await state.set_state(PurchaseStates.waiting_recipient_username)
+    await state.update_data(invoice_id=invoice_id)
+    if not completed and order["status"] != "paid":
         await callback.answer("Заказ уже был обработан", show_alert=True)
+        return
+    if updated_user is None:
+        await callback.answer("Не удалось найти заказ", show_alert=True)
         return
     await edit_inline_message(
         callback,
-        "✅ Оплата прошла успешно!\n\n"
-        f"Начислено: <b>{order['stars']}</b> ⭐\n"
-        f"Сумма: <b>{money(order['amount_rub'])} ₽</b>\n"
-        f"Ваш баланс: <b>{money(updated_user['balance'])} ₽</b>\n\n"
-        "Укажите @username аккаунта, которому будут отправлены звёзды / premium."
+        f"{premium_emoji('5364035134725043602', '✅')} Оплата прошла успешно!\n\n"
+        + (
+            f"Заказ: <b>{order['stars']}</b> ⭐\n"
+            if order["product_type"] == "stars"
+            else f"Заказ: <b>Telegram Premium на {order['premium_months']} мес.</b>\n"
+        )
+        + f"Сумма: <b>{money(order['amount_rub'])} ₽</b>\n"
+        "Укажите @username аккаунта, которому будет отправлен заказ."
     )
     await callback.answer("Готово")
 
@@ -882,6 +1298,9 @@ async def wait_top_up_payment(callback: CallbackQuery) -> None:
         return
     if status != "paid" or not topup:
         await callback.answer("Оплата пока не найдена", show_alert=True)
+        return
+    if topup["user_id"] != callback.from_user.id:
+        await callback.answer("Этот счёт принадлежит другому пользователю", show_alert=True)
         return
     if callback.message:
         await callback.message.edit_reply_markup(
@@ -908,6 +1327,9 @@ async def finish_paid_top_up(callback: CallbackQuery) -> None:
     if status != "paid" or not topup:
         await callback.answer("Оплата пока не найдена", show_alert=True)
         return
+    if topup["user_id"] != callback.from_user.id:
+        await callback.answer("Этот счёт принадлежит другому пользователю", show_alert=True)
+        return
 
     completed, updated_user = await get_db(callback).complete_crypto_topup(invoice_id)
     if not completed:
@@ -915,7 +1337,7 @@ async def finish_paid_top_up(callback: CallbackQuery) -> None:
         return
     await edit_inline_message(
         callback,
-        "✅ Оплата прошла успешно!\n\n"
+        f"{premium_emoji('5364035134725043602', '✅')} Оплата прошла успешно!\n\n"
         f"Баланс пополнен на: <b>{money(topup['amount_rub'])} ₽</b>\n"
         f"Ваш баланс: <b>{money(updated_user['balance'])} ₽</b>",
         reply_markup=profile_menu(),
@@ -934,7 +1356,7 @@ async def profile(message: Message, state: FSMContext) -> None:
 @router.callback_query(F.data == PROFILE_TOP_UP)
 async def top_up(callback: CallbackQuery, state: FSMContext) -> None:
     await state.set_state(TopUpStates.waiting_amount)
-    await edit_inline_message(callback, top_up_text(), reply_markup=back_menu(PROFILE_BACK_CALLBACK))
+    await edit_inline_message(callback, top_up_text(), reply_markup=top_up_amount_menu())
     await callback.answer()
 
 
@@ -1035,14 +1457,14 @@ async def show_top_up_crypto_invoice(callback: CallbackQuery) -> None:
 async def help_handler(message: Message, state: FSMContext) -> None:
     await clear_flow_state(state)
     await ensure_current_user(message)
-    await send_photo_page(message, state, help_text(), HELP_IMAGE, reply_markup=back_menu())
+    await send_photo_page(message, state, help_text(), HELP_IMAGE)
 
 
 @router.message(F.text.in_(INFO_TEXTS))
 async def info_handler(message: Message, state: FSMContext) -> None:
     await clear_flow_state(state)
     await ensure_current_user(message)
-    await send_page(message, state, info_text(), reply_markup=back_menu())
+    await send_page(message, state, info_text())
 
 
 @router.message(F.text == BACK)
@@ -1137,9 +1559,9 @@ async def payment_action(callback: CallbackQuery) -> None:
         return
 
     if status == "paid":
-        text = f"✅ Заявка #{payment['id']} подтверждена. Баланс пополнен на {money(payment['amount_rub'])} ₽."
+        text = f"{premium_emoji('5364035134725043602', '✅')} Заявка #{payment['id']} подтверждена. Баланс пополнен на {money(payment['amount_rub'])} ₽."
         user_text = (
-            f"✅ Пополнение #{payment['id']} подтверждено.\n"
+            f"{premium_emoji('5364035134725043602', '✅')} Пополнение #{payment['id']} подтверждено.\n"
             f"Баланс пополнен на <b>{money(payment['amount_rub'])} ₽</b>."
         )
     else:
@@ -1198,6 +1620,107 @@ async def handle_manual_money(message: Message, state: FSMContext) -> None:
     await clear_flow_state(state)
     await ensure_current_user(message)
     await send_page(message, state, order_text(stars, amount), reply_markup=order_keyboard(stars, amount))
+
+
+@router.message(PurchaseStates.waiting_recipient_username)
+async def handle_recipient_username(message: Message, state: FSMContext) -> None:
+    data = await state.get_data()
+    invoice_id = data.get("invoice_id")
+    username = parse_username(message.text or "")
+    if not invoice_id or username is None:
+        await send_page(
+            message,
+            state,
+            "Введите username получателя в формате <code>@username</code>.",
+            reply_markup=back_menu(MAIN_BACK_CALLBACK),
+        )
+        return
+
+    order = await get_db(message).get_crypto_order(int(invoice_id))
+    if not order or order["user_id"] != message.from_user.id or order["status"] != "paid":
+        await clear_flow_state(state)
+        await send_page(message, state, "Оплаченный заказ не найден.", reply_markup=main_menu(False))
+        return
+
+    if order["istar_order_id"]:
+        await clear_flow_state(state)
+        await send_page(
+            message,
+            state,
+            f"Заказ уже отправлен в IStars: <code>{order['istar_order_id']}</code>.",
+            reply_markup=main_menu(message.from_user.id in get_settings_ready().admin_id_set),
+        )
+        return
+
+    if not get_settings_ready().istar_api_key:
+        await send_page(
+            message,
+            state,
+            "IStars пока не подключен. Добавьте <code>ISTAR_API_KEY</code> в .env и перезапустите бота.",
+            reply_markup=back_menu(MAIN_BACK_CALLBACK),
+        )
+        return
+
+    try:
+        if order["product_type"] == "premium":
+            recipient = await get_istar_premium_recipient(username, int(order["premium_months"]))
+            if recipient.get("success") is False or not recipient.get("recipient"):
+                raise RuntimeError(str(recipient))
+            await asyncio.sleep(1.1)
+            istar_order = await create_istar_premium_order(
+                username,
+                str(recipient["recipient"]),
+                int(order["premium_months"]),
+            )
+        else:
+            recipient = await get_istar_star_recipient(username, int(order["stars"]))
+            if recipient.get("success") is False or not recipient.get("recipient"):
+                raise RuntimeError(str(recipient))
+            await asyncio.sleep(1.1)
+            istar_order = await create_istar_star_order(username, str(recipient["recipient"]), int(order["stars"]))
+        await get_db(message).set_crypto_order_istar_submitted(
+            int(invoice_id),
+            username,
+            str(recipient["recipient"]),
+            str(istar_order.get("order_id", "")),
+            str(istar_order.get("status", "pending")),
+        )
+    except Exception as exc:
+        logging.exception("iStar order failed for invoice %s", invoice_id)
+        await get_db(message).set_crypto_order_istar_error(int(invoice_id), str(exc))
+        await send_page(
+            message,
+            state,
+            f"Не удалось отправить заказ в IStars.\n\n<code>{exc}</code>",
+            reply_markup=back_menu(MAIN_BACK_CALLBACK),
+        )
+        return
+
+    await clear_flow_state(state)
+    await send_page(
+        message,
+        state,
+        "Заказ отправлен в IStars.\n\n"
+        f"Получатель: <b>@{username}</b>\n"
+        + (
+            f"Звёзды: <b>{order['stars']}</b>\n"
+            if order["product_type"] == "stars"
+            else f"Premium: <b>{order['premium_months']} мес.</b>\n"
+        )
+        + f"IStars order: <code>{istar_order.get('order_id', '')}</code>",
+        reply_markup=main_menu(message.from_user.id in get_settings_ready().admin_id_set),
+    )
+
+
+@router.message(F.text.startswith("@"))
+async def handle_late_recipient_username(message: Message, state: FSMContext) -> None:
+    order = await get_db(message).get_latest_unsubmitted_paid_crypto_order(message.from_user.id)
+    if not order:
+        user = await ensure_current_user(message)
+        await send_page(message, state, "Выберите действие в меню ниже.", reply_markup=main_menu(user["is_admin"]))
+        return
+    await state.update_data(invoice_id=order["invoice_id"])
+    await handle_recipient_username(message, state)
 
 
 @router.message()

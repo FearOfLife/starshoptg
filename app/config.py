@@ -36,6 +36,13 @@ class Settings:
     price_per_star_rub: float = 1.5
     crypto_bot_token: str = ""
     crypto_bot_api_url: str = "https://pay.crypt.bot"
+    istar_api_key: str = ""
+    istar_api_url: str = "https://v1.fragmentapi.com/api/v1/partner"
+    istar_wallet_type: str = "TON"
+    istar_webhook_secret: str = ""
+    premium_3_months_rub: float = 1259
+    premium_6_months_rub: float = 1679
+    premium_12_months_rub: float = 3044
     web_host: str = "127.0.0.1"
     web_port: int = 8080
     public_base_url: str = ""
@@ -61,6 +68,13 @@ def get_settings() -> Settings:
         price_per_star_rub=float(_env("PRICE_PER_STAR_RUB", file_values, "1.5")),
         crypto_bot_token=_env("CRYPTOBOT_TOKEN", file_values, ""),
         crypto_bot_api_url=_env("CRYPTOBOT_API_URL", file_values, "https://pay.crypt.bot"),
+        istar_api_key=_env("ISTAR_API_KEY", file_values, ""),
+        istar_api_url=_env("ISTAR_API_URL", file_values, "https://v1.fragmentapi.com/api/v1/partner"),
+        istar_wallet_type=_env("ISTAR_WALLET_TYPE", file_values, "TON"),
+        istar_webhook_secret=_env("ISTAR_WEBHOOK_SECRET", file_values, ""),
+        premium_3_months_rub=float(_env("PREMIUM_3_MONTHS_RUB", file_values, "1259")),
+        premium_6_months_rub=float(_env("PREMIUM_6_MONTHS_RUB", file_values, "1679")),
+        premium_12_months_rub=float(_env("PREMIUM_12_MONTHS_RUB", file_values, "3044")),
         web_host=_env("WEB_HOST", file_values, "127.0.0.1"),
         web_port=int(_env("WEB_PORT", file_values, "8080")),
         public_base_url=_env("PUBLIC_BASE_URL", file_values, ""),
