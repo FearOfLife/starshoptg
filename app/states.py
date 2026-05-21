@@ -8,3 +8,7 @@ class TopUpStates(StatesGroup):
 class ConvertStates(StatesGroup):
     waiting_money = State()
     waiting_stars = State()
+
+
+class PurchaseStates(StatesGroup):
+    waiting_recipient_username = State()

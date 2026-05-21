@@ -7,8 +7,14 @@ HELP = "Помощь"
 INFO = "Информация"
 BACK = "Назад"
 
-STARS_TO_MONEY = "По кол-ву ⭐️"
-MONEY_TO_STARS = "⭐️ По кол-ву"
+STARS_TO_MONEY = "шт."
+MONEY_TO_STARS = "шт"
+ICON_ONLY_BUTTON_TEXT = "\u2060"
+BUY_CATEGORY_STARS = "Звёзды"
+BUY_CATEGORY_PREMIUM = "Премиум"
+PREMIUM_3_MONTHS = "3 месяца"
+PREMIUM_6_MONTHS = "6 месяцев"
+PREMIUM_12_MONTHS = "12 месяцев"
 
 PROFILE_TOP_UP = "Пополнить баланс"
 
@@ -26,8 +32,13 @@ MENU_BUTTON_ICON_IDS = {
 }
 
 INLINE_BUTTON_ICON_IDS = {
-    STARS_TO_MONEY: "5201873447554145566",
-    MONEY_TO_STARS: "5201873447554145566",
+    STARS_TO_MONEY: "5458501939673192257",
+    MONEY_TO_STARS: "5463289097336405244",
+    BUY_CATEGORY_STARS: "5947363097353130662",
+    BUY_CATEGORY_PREMIUM: "5260725503215543617",
+    PREMIUM_3_MONTHS: "5260725503215543617",
+    PREMIUM_6_MONTHS: "5260725503215543617",
+    PREMIUM_12_MONTHS: "5260725503215543617",
     PROFILE_TOP_UP: "5415594207068822547",
     BACK: "5255703720078879038",
 }
@@ -35,9 +46,17 @@ INLINE_BUTTON_ICON_IDS = {
 INLINE_BUTTON_STYLES = {
     STARS_TO_MONEY: "primary",
     MONEY_TO_STARS: "primary",
+    BUY_CATEGORY_STARS: "success",
+    BUY_CATEGORY_PREMIUM: "primary",
+    PREMIUM_3_MONTHS: "primary",
+    PREMIUM_6_MONTHS: "primary",
+    PREMIUM_12_MONTHS: "primary",
     PROFILE_TOP_UP: "success",
     BACK: "danger",
 }
+
+STAR_OPTION_ICON_ID = "5458501939673192257"
+MONEY_OPTION_ICON_ID = "5947363097353130662"
 
 BUY_STARS_TEXTS = {BUY_STARS, "🌟 К покупкам"}
 PROFILE_TEXTS = {PROFILE, "🏡 Профиль"}
@@ -45,6 +64,7 @@ HELP_TEXTS = {HELP, "🆘 Помощь"}
 INFO_TEXTS = {INFO, "💳 Информация"}
 
 MAIN_BACK_CALLBACK = "main_back"
+BUY_CATEGORY_BACK_CALLBACK = "buy_category_back"
 BUY_MENU_BACK_CALLBACK = "buy_menu_back"
 PROFILE_BACK_CALLBACK = "profile_back"
 
@@ -99,17 +119,17 @@ TOP_UP_OPTIONS: tuple[int, ...] = (100, 250, 500, 1000, 2000, 5000)
 
 
 def star_option_label(stars: int, price_rub: int) -> str:
-    return f"{stars} • {price_rub} р."
+    return f"{stars} • {price_rub}"
 
 
 def money_option_label(stars: int, price_rub: int) -> str:
-    return f"🌟 {stars} • {price_rub} р."
+    return f"{stars} • {price_rub} р."
 
 
 STAR_OPTION_LABELS = {star_option_label(stars, price): (stars, price) for stars, price in STAR_OPTIONS}
 MONEY_OPTION_LABELS = {money_option_label(stars, price): (stars, price) for stars, price in MONEY_OPTIONS}
 ORDER_OPTION_LABELS = STAR_OPTION_LABELS | MONEY_OPTION_LABELS
-TOP_UP_OPTION_LABELS = {f"💰 {amount} р.": amount for amount in TOP_UP_OPTIONS}
+TOP_UP_OPTION_LABELS = {f"{amount} р.": amount for amount in TOP_UP_OPTIONS}
 
 
 def _reply_keyboard(rows: list[list[str]]) -> ReplyKeyboardMarkup:
@@ -160,24 +180,75 @@ def main_menu(is_admin: bool = False) -> ReplyKeyboardMarkup:
 def buy_menu() -> InlineKeyboardMarkup:
     return _inline_keyboard(
         [
-            [(STARS_TO_MONEY, STARS_TO_MONEY), (MONEY_TO_STARS, MONEY_TO_STARS)],
-            [(BACK, MAIN_BACK_CALLBACK)],
+            [(BUY_CATEGORY_STARS, BUY_CATEGORY_STARS)],
+            [(BUY_CATEGORY_PREMIUM, BUY_CATEGORY_PREMIUM)],
+        ]
+    )
+
+
+def stars_buy_menu() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        inline_keyboard=[
+            [
+                InlineKeyboardButton(
+                    text=ICON_ONLY_BUTTON_TEXT,
+                    callback_data=STARS_TO_MONEY,
+                    icon_custom_emoji_id=INLINE_BUTTON_ICON_IDS.get(STARS_TO_MONEY),
+                    style=INLINE_BUTTON_STYLES.get(STARS_TO_MONEY),
+                ),
+                InlineKeyboardButton(
+                    text=ICON_ONLY_BUTTON_TEXT,
+                    callback_data=MONEY_TO_STARS,
+                    icon_custom_emoji_id=INLINE_BUTTON_ICON_IDS.get(MONEY_TO_STARS),
+                    style=INLINE_BUTTON_STYLES.get(MONEY_TO_STARS),
+                ),
+            ],
+            [
+                InlineKeyboardButton(
+                    text=BACK,
+                    callback_data=BUY_CATEGORY_BACK_CALLBACK,
+                    icon_custom_emoji_id=INLINE_BUTTON_ICON_IDS.get(BACK),
+                    style=INLINE_BUTTON_STYLES.get(BACK),
+                )
+            ],
+        ]
+    )
+
+
+def premium_months_menu() -> InlineKeyboardMarkup:
+    return _inline_keyboard(
+        [
+            [(PREMIUM_3_MONTHS, PREMIUM_3_MONTHS), (PREMIUM_6_MONTHS, PREMIUM_6_MONTHS)],
+            [(PREMIUM_12_MONTHS, PREMIUM_12_MONTHS)],
+            [(BACK, BUY_CATEGORY_BACK_CALLBACK)],
         ]
     )
 
 
 def stars_amount_menu() -> InlineKeyboardMarkup:
     labels = [star_option_label(stars, price) for stars, price in STAR_OPTIONS]
-    rows = [[(label, label) for label in labels[index : index + 2]] for index in range(0, len(labels), 2)]
-    rows.append([(BACK, BUY_MENU_BACK_CALLBACK)])
-    return _inline_keyboard(rows)
+    rows = [
+        [
+            InlineKeyboardButton(text=label, callback_data=label, icon_custom_emoji_id=STAR_OPTION_ICON_ID)
+            for label in labels[index : index + 2]
+        ]
+        for index in range(0, len(labels), 2)
+    ]
+    rows.append([InlineKeyboardButton(text=BACK, callback_data=BUY_MENU_BACK_CALLBACK, icon_custom_emoji_id=INLINE_BUTTON_ICON_IDS.get(BACK), style=INLINE_BUTTON_STYLES.get(BACK))])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def money_amount_menu() -> InlineKeyboardMarkup:
     labels = [money_option_label(stars, price) for stars, price in MONEY_OPTIONS]
-    rows = [[(label, label) for label in labels[index : index + 2]] for index in range(0, len(labels), 2)]
-    rows.append([(BACK, BUY_MENU_BACK_CALLBACK)])
-    return _inline_keyboard(rows)
+    rows = [
+        [
+            InlineKeyboardButton(text=label, callback_data=label, icon_custom_emoji_id=MONEY_OPTION_ICON_ID)
+            for label in labels[index : index + 2]
+        ]
+        for index in range(0, len(labels), 2)
+    ]
+    rows.append([InlineKeyboardButton(text=BACK, callback_data=BUY_MENU_BACK_CALLBACK, icon_custom_emoji_id=INLINE_BUTTON_ICON_IDS.get(BACK), style=INLINE_BUTTON_STYLES.get(BACK))])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def profile_menu() -> InlineKeyboardMarkup:
@@ -208,7 +279,11 @@ def payment_admin_keyboard(payment_id: int) -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
-                InlineKeyboardButton(text="✅ Подтвердить", callback_data=f"payment:approve:{payment_id}"),
+                InlineKeyboardButton(
+                    text="Подтвердить",
+                    callback_data=f"payment:approve:{payment_id}",
+                    icon_custom_emoji_id="5364035134725043602",
+                ),
                 InlineKeyboardButton(text="❌ Отклонить", callback_data=f"payment:cancel:{payment_id}"),
             ]
         ]
