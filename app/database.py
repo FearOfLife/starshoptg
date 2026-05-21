@@ -47,6 +47,29 @@ CREATE TABLE IF NOT EXISTS buyers (
     status TEXT NOT NULL DEFAULT 'completed',
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
+
+CREATE TABLE IF NOT EXISTS crypto_orders (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+    invoice_id BIGINT NOT NULL UNIQUE,
+    stars BIGINT NOT NULL CHECK (stars > 0),
+    amount_rub NUMERIC(12, 2) NOT NULL CHECK (amount_rub > 0),
+    pay_url TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    paid_at TIMESTAMPTZ
+);
+
+CREATE TABLE IF NOT EXISTS crypto_topups (
+    id SERIAL PRIMARY KEY,
+    user_id BIGINT NOT NULL REFERENCES users(telegram_id) ON DELETE CASCADE,
+    invoice_id BIGINT NOT NULL UNIQUE,
+    amount_rub NUMERIC(12, 2) NOT NULL CHECK (amount_rub > 0),
+    pay_url TEXT NOT NULL DEFAULT '',
+    status TEXT NOT NULL DEFAULT 'active',
+    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    paid_at TIMESTAMPTZ
+);
 """
 
 
@@ -197,6 +220,147 @@ class Database:
                 updated_user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", user_id)
                 return True, updated_user
 
+    async def create_crypto_order(
+        self,
+        user_id: int,
+        invoice_id: int,
+        stars: int,
+        amount: Decimal,
+        pay_url: str,
+    ) -> asyncpg.Record:
+        return await self._pool().fetchrow(
+            """
+            INSERT INTO crypto_orders (user_id, invoice_id, stars, amount_rub, pay_url)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (invoice_id) DO UPDATE SET
+                pay_url = EXCLUDED.pay_url
+            RETURNING *
+            """,
+            user_id,
+            invoice_id,
+            stars,
+            amount,
+            pay_url,
+        )
+
+    async def get_crypto_order(self, invoice_id: int) -> asyncpg.Record | None:
+        return await self._pool().fetchrow(
+            "SELECT * FROM crypto_orders WHERE invoice_id = $1",
+            invoice_id,
+        )
+
+    async def complete_crypto_order(self, invoice_id: int) -> tuple[bool, asyncpg.Record | None]:
+        async with self._pool().acquire() as conn:
+            async with conn.transaction():
+                order = await conn.fetchrow(
+                    "SELECT * FROM crypto_orders WHERE invoice_id = $1 FOR UPDATE",
+                    invoice_id,
+                )
+                if not order:
+                    return False, None
+                if order["status"] == "paid":
+                    user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", order["user_id"])
+                    return False, user
+
+                await conn.execute(
+                    """
+                    UPDATE crypto_orders
+                    SET status = 'paid', paid_at = NOW()
+                    WHERE invoice_id = $1
+                    """,
+                    invoice_id,
+                )
+                await conn.execute(
+                    """
+                    UPDATE users
+                    SET purchased_stars = purchased_stars + $1,
+                        updated_at = NOW()
+                    WHERE telegram_id = $2
+                    """,
+                    order["stars"],
+                    order["user_id"],
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO buyers (user_id, product_id, stars, amount_rub)
+                    VALUES ($1, NULL, $2, $3)
+                    """,
+                    order["user_id"],
+                    order["stars"],
+                    order["amount_rub"],
+                )
+                user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", order["user_id"])
+                return True, user
+
+    async def create_crypto_topup(
+        self,
+        user_id: int,
+        invoice_id: int,
+        amount: Decimal,
+        pay_url: str,
+    ) -> asyncpg.Record:
+        return await self._pool().fetchrow(
+            """
+            INSERT INTO crypto_topups (user_id, invoice_id, amount_rub, pay_url)
+            VALUES ($1, $2, $3, $4)
+            ON CONFLICT (invoice_id) DO UPDATE SET
+                pay_url = EXCLUDED.pay_url
+            RETURNING *
+            """,
+            user_id,
+            invoice_id,
+            amount,
+            pay_url,
+        )
+
+    async def get_crypto_topup(self, invoice_id: int) -> asyncpg.Record | None:
+        return await self._pool().fetchrow(
+            "SELECT * FROM crypto_topups WHERE invoice_id = $1",
+            invoice_id,
+        )
+
+    async def complete_crypto_topup(self, invoice_id: int) -> tuple[bool, asyncpg.Record | None]:
+        async with self._pool().acquire() as conn:
+            async with conn.transaction():
+                topup = await conn.fetchrow(
+                    "SELECT * FROM crypto_topups WHERE invoice_id = $1 FOR UPDATE",
+                    invoice_id,
+                )
+                if not topup:
+                    return False, None
+                user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1 FOR UPDATE", topup["user_id"])
+                if topup["status"] == "paid":
+                    return False, user
+
+                await conn.execute(
+                    """
+                    UPDATE crypto_topups
+                    SET status = 'paid', paid_at = NOW()
+                    WHERE invoice_id = $1
+                    """,
+                    invoice_id,
+                )
+                await conn.execute(
+                    """
+                    UPDATE users
+                    SET balance = balance + $1,
+                        updated_at = NOW()
+                    WHERE telegram_id = $2
+                    """,
+                    topup["amount_rub"],
+                    topup["user_id"],
+                )
+                await conn.execute(
+                    """
+                    INSERT INTO payments (user_id, amount_rub, status, paid_at)
+                    VALUES ($1, $2, 'paid', NOW())
+                    """,
+                    topup["user_id"],
+                    topup["amount_rub"],
+                )
+                user = await conn.fetchrow("SELECT * FROM users WHERE telegram_id = $1", topup["user_id"])
+                return True, user
+
     async def stats(self) -> dict[str, Any]:
         row = await self._pool().fetchrow(
             """
@@ -207,6 +371,19 @@ class Database:
                 (SELECT COALESCE(SUM(amount_rub), 0) FROM buyers WHERE status = 'completed') AS sold_amount,
                 (SELECT COUNT(*) FROM payments WHERE status = 'pending') AS pending_payments
             """
+        )
+        return dict(row)
+
+    async def user_purchase_stats(self, user_id: int) -> dict[str, Any]:
+        row = await self._pool().fetchrow(
+            """
+            SELECT
+                COUNT(*) AS orders_count,
+                COALESCE(SUM(amount_rub), 0) AS total_spent
+            FROM buyers
+            WHERE user_id = $1 AND status = 'completed'
+            """,
+            user_id,
         )
         return dict(row)
 

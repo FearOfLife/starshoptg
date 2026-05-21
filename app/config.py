@@ -34,6 +34,11 @@ class Settings:
     admin_ids: str = ""
     support_username: str = "123"
     price_per_star_rub: float = 1.5
+    crypto_bot_token: str = ""
+    crypto_bot_api_url: str = "https://pay.crypt.bot"
+    web_host: str = "127.0.0.1"
+    web_port: int = 8080
+    public_base_url: str = ""
 
     @property
     def admin_id_set(self) -> set[int]:
@@ -54,4 +59,9 @@ def get_settings() -> Settings:
         admin_ids=_env("ADMIN_IDS", file_values, ""),
         support_username=_env("SUPPORT_USERNAME", file_values, "123"),
         price_per_star_rub=float(_env("PRICE_PER_STAR_RUB", file_values, "1.5")),
+        crypto_bot_token=_env("CRYPTOBOT_TOKEN", file_values, ""),
+        crypto_bot_api_url=_env("CRYPTOBOT_API_URL", file_values, "https://pay.crypt.bot"),
+        web_host=_env("WEB_HOST", file_values, "127.0.0.1"),
+        web_port=int(_env("WEB_PORT", file_values, "8080")),
+        public_base_url=_env("PUBLIC_BASE_URL", file_values, ""),
     )
